@@ -1,0 +1,1253 @@
+//@version=6
+strategy("SV Liquidity", overlay = true,
+     max_boxes_count      = 500,
+     max_lines_count      = 500,
+     max_labels_count     = 500,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 1,
+     pyramiding           = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick   = false,
+     calc_on_order_fills  = false)
+
+
+//  USER-DEFINED TYPES                                         
+
+type FVGZone
+    float   top
+    float   bot
+    bool    isBull
+    int     startBar
+    box     bx
+    bool    mitigated
+    bool    hasDisplacement
+    float   dispStrength
+
+
+//   INPUTS                                                     
+
+var GRP_CORE = "══  Core  ══"
+var GRP_A    = "══  Module A · Liquidity Sweeps (SMC)  ══"
+var GRP_B    = "══  Module B · Market Structure  ══"
+var GRP_C    = "══  Module C · Displacement FVGs  ══"
+var GRP_D    = "══  Module D · TJR Entry Model  ══"
+var GRP_E    = "══  Module E · Market Condition Filters  ══"
+var GRP_E1   = "  E1 · Market Regime Filter"
+var GRP_E2   = "  E2 · Volatility Band Filter"
+var GRP_E3   = "  E3 · Momentum Quality Filter"
+var GRP_E4   = "  E4 · Higher-Timeframe Bias (HTF EMA)"
+var GRP_E5   = "  E5 · Displacement Strength Gate"
+var GRP_E6   = "  E6 · FVG Quality Gate"
+var GRP_E7   = "  E7 · Entry Confirmation"
+var GRP_E8   = "  E8 · Cooldown Timer"
+var GRP_KZ   = "══  Killzones  ══"
+var GRP_UI   = "══  UI / Legend  ══"
+
+// ── Core ────────────────────────────────────────────────────────
+i_pivotLen    = input.int  (5,    "Pivot Lookback",            group = GRP_CORE, minval = 2, maxval = 50,
+     tooltip = "5 on 1m = pivot confirmed after 5 bars (5 mins). Lower = more pivots found, more sweep opportunities detected.")
+i_atrLen      = input.int  (14,   "ATR / Avg-Body Length",     group = GRP_CORE, minval = 5)
+i_dispMult    = input.float(1.4,  "Displacement Mult (×)",     group = GRP_CORE, minval = 1.0, step = 0.1)
+i_maxBars     = input.int  (250,  "Max Bars Between Events",   group = GRP_CORE, minval = 5, maxval = 300,
+     tooltip = "250 on 1m = ~4 hours for a setup to complete across full session.")
+i_sweepMargin = input.float(0.25, "Sweep Margin (× ATR)",      group = GRP_CORE, minval = 0.0, step = 0.05,
+     tooltip = "Wick must exceed pivot by at least this fraction of ATR to count as a sweep")
+
+// The structural SL lookback was previously hardcoded at 200 bars. On ranging 1m markets
+// that caused the lowest/highest extreme to be anchored 200 minutes in the past, producing
+// stops so wide they exceeded broker margin thresholds and triggered immediate margin calls
+// before price ever reached the intended stop level. This input exposes that window so it
+// can be tuned per pair and timeframe.
+i_slStructWindow = input.int(50, "Structural SL Lookback (bars)",
+     group = GRP_CORE, minval = 10, maxval = 100,
+     tooltip = "How far back the system looks for the structural extreme when placing the stop loss. 50 bars on 1m = 50 minutes. Recommended: 30–50.")
+
+// Without a hard ceiling on SL distance, a wide structural window combined with a
+// low-volatility pair could produce an entry-to-stop gap that breaches margin requirements,
+// causing an immediate margin call. This cap prevents that regardless of structural conditions.
+i_maxSlAtr    = input.float(6.0, "Max SL Distance (× ATR)",
+     group = GRP_CORE, minval = 2.0, maxval = 15.0, step = 0.5,
+     tooltip = "Hard ceiling on how far the stop loss can be from entry, measured in ATR. Prevents margin calls caused by abnormally wide structural stops. 6 ATR recommended on 1m.")
+
+// ── Module A ────────────────────────────────────────────────────
+i_showA       = input.bool (true, "Show Module A",             group = GRP_A)
+i_colBSL      = input.color(color.new(#FFD700, 0),  "BSL Color", group = GRP_A)
+i_colSSL      = input.color(color.new(#FF8C00, 0),  "SSL Color", group = GRP_A)
+
+// ── Module B ────────────────────────────────────────────────────
+i_showB       = input.bool (true, "Show Module B",             group = GRP_B)
+i_useVol      = input.bool (false, "Require High Volume on MSS", group = GRP_B,
+     tooltip = "OFF by default for Forex — tick volume is unreliable on FX pairs. Enable only for stocks/futures.")
+i_colBOS      = input.color(color.new(#00BCD4, 0),  "BOS Color",   group = GRP_B)
+i_colMSS      = input.color(color.new(#AB47BC, 0),  "MSS Color",   group = GRP_B)
+
+// ── Module C ────────────────────────────────────────────────────
+i_showC       = input.bool (true, "Show Module C",             group = GRP_C)
+i_minFvgAtr   = input.float(0.0,  "Min FVG Gap (× ATR)",       group = GRP_C, minval = 0.0, step = 0.05)
+i_colFVGBullF = input.color(color.new(#00E676, 82), "Bull FVG Fill",   group = GRP_C)
+i_colFVGBearF = input.color(color.new(#FF1744, 82), "Bear FVG Fill",   group = GRP_C)
+i_colFVGBullB = input.color(color.new(#00E676, 25), "Bull FVG Border", group = GRP_C)
+i_colFVGBearB = input.color(color.new(#FF1744, 25), "Bear FVG Border", group = GRP_C)
+i_extendFVG   = input.bool (true, "Extend FVG Until Mitigated", group = GRP_C)
+i_deleteMit   = input.bool (true, "Delete FVGs Once Mitigated", group = GRP_C)
+
+// ── Module D ────────────────────────────────────────────────────
+i_showD       = input.bool (true, "Show Module D (Signals)",   group = GRP_D)
+i_rr80        = input.float(3.0,  "RR (Conf ≥ 0.8)",           group = GRP_D, step = 0.1,
+     tooltip = "3.0 for high-confidence setups — wider structural SL means bigger moves needed to justify risk.")
+i_rr60        = input.float(2.0,  "RR (Conf 0.6–0.8)",         group = GRP_D, step = 0.1)
+i_rr40        = input.float(1.5,  "RR (Conf 0.4–0.6)",         group = GRP_D, step = 0.1)
+i_rr20        = input.float(1.0,  "RR (Conf < 0.4)",           group = GRP_D, step = 0.1)
+i_maxTpAtr    = input.float(6.0,  "Max TP Distance (× ATR)",   group = GRP_D, step = 0.5,
+     tooltip = "6 ATR cap — allows big momentum moves to run. Trail will follow if price keeps going.")
+i_useFixedSL  = input.bool (false, "Use Fixed ATR Stop Loss",  group = GRP_D)
+i_fixedSLAtr  = input.float(1.0,  "Fixed SL Distance (× ATR)", group = GRP_D, step = 0.1)
+i_slNoiseLen  = input.int  (2,    "SL Noise Lookback (bars)",   group = GRP_D, minval = 1, maxval = 10,
+     tooltip = "Expands SL to the lowest low (bull) or highest high (bear) of the last N bars before entry, capturing recent noise structure. Set to 1 to disable.")
+i_strictOpp   = input.bool (false, "Invalidate on Opposing Sweep", group = GRP_D)
+i_useOpPivotCheck = input.bool (false, "Require Clean TP to Next Pivot", group = GRP_D)
+
+// Lowered from the original 2.0 to 1.5. On tightly ranging pairs such as AUDCAD,
+// a 2.0 ATR minimum pushed the stop to a distance that breached broker margin on the
+// 1% position size, generating instant margin calls rather than genuine stop-outs.
+i_minRiskATR  = input.float(1.5,  "Min Distance Entry→SL (× ATR)", group = GRP_D, minval = 0.1, step = 0.1,
+     tooltip = "SL will always be at least this many ATRs from entry. On 1m, 1.5 is the recommended minimum to survive noise.")
+i_slPad80     = input.float(0.8,  "SL Pad (Conf ≥ 0.8)",       group = GRP_D, step = 0.1)
+i_slPad60     = input.float(0.5,  "SL Pad (Conf 0.6–0.8)",     group = GRP_D, step = 0.1)
+i_slPad40     = input.float(0.3,  "SL Pad (Conf 0.4–0.6)",     group = GRP_D, step = 0.05)
+i_slPad20     = input.float(0.2,  "SL Pad (Conf < 0.4)",       group = GRP_D, step = 0.1)
+i_colBuy      = input.color(color.new(#00E676, 0), "BUY Color",  group = GRP_D)
+i_colSell     = input.color(color.new(#FF1744, 0), "SELL Color", group = GRP_D)
+i_showTP      = input.bool (true, "Show TP Projection Line",    group = GRP_D)
+i_showSL      = input.bool (true, "Show SL Line",               group = GRP_D)
+i_tpExtBars   = input.int  (25,   "TP/SL Line Length (bars)",   group = GRP_D, minval = 5, maxval = 100)
+
+// ── Trailing / Break-Even ────────────────────────────────────────
+i_useBE       = input.bool (true,  "Break-Even at 40% of TP",    group = GRP_D,
+     tooltip = "When price closes 40% of the way to TP, SL is moved to entry. Protects against reversals before they become full losses.")
+i_useTrail    = input.bool (true,  "Trail Stop at 80% of TP",    group = GRP_D,
+     tooltip = "When price closes 80% of the way to TP, SL locks to original TP and TP extends to the multiplier below.")
+i_trailTpMult = input.float(1.5,  "Extended TP Multiplier (×)",  group = GRP_D, step = 0.5, minval = 1.5,
+     tooltip = "1.5 = 1.5 the original TP distance after trail triggers. Lets trending pairs run much further.")
+i_trailAtr    = input.float(1.0,  "Trail Gap (× ATR)",           group = GRP_D, step = 0.1, minval = 0.5,
+     tooltip = "1.0 ATR trail gap — tighter follow on 1m to capture more of the move without giving back too much.")
+
+// ── Module E — Master switch + Mode ─────────────────────────────
+i_enableFilters = input.bool(true, "Enable All Market Condition Filters", group = GRP_E,
+     tooltip = "Master switch. When OFF, ALL Module E sub-filters are bypassed and original logic runs.")
+i_filterMode    = input.string("Conservative", "Filter Mode",
+     options = ["Conservative", "Balanced", "Aggressive"], group = GRP_E,
+     tooltip = "Conservative = strictest gates, fewest trades, highest precision.\nBalanced = recommended default.\nAggressive = looser gates, more trades.")
+i_showFilterLbl = input.bool(true, "Show Filter-Fail Labels (debug)", group = GRP_E,
+     tooltip = "Draws small labels above bars explaining why a signal was blocked.")
+
+// ── E1 · Market Regime ──────────────────────────────────────────
+i_e1Enable     = input.bool (true,  "Enable E1 · Regime Filter",   group = GRP_E1,
+     tooltip = "ON by default for 1m. Blocks trades during ranging/consolidation — the environment where 1m MSSs most often reverse back through the FVG.")
+i_regimeLookback = input.int(30,    "Regime Lookback (bars)",       group = GRP_E1, minval = 5, maxval = 100,
+     tooltip = "30 bars on 1m = 30 min window. Longer lookback = smoother, less sensitive regime reading.")
+i_expansionMult  = input.float(1.0,  "Expansion Threshold (×)",     group = GRP_E1, minval = 1.0, step = 0.05,
+     tooltip = "1.0 = allow any expansion. Raise to 1.1+ to require clearly wider conditions.")
+
+// ── E2 · Volatility Band ────────────────────────────────────────
+i_e2Enable    = input.bool (false,  "Enable E2 · Volatility Filter", group = GRP_E2,
+     tooltip = "Disabled by default. Enable to block dead/spikey markets. Tune the band to your pair and TF first.")
+i_atrPctMin   = input.float(0.0003, "Min ATR/Price Ratio (e.g. 0.0003 = 0.03%)", group = GRP_E2, step = 0.0001, minval = 0.0)
+i_atrPctMax   = input.float(0.0080, "Max ATR/Price Ratio (e.g. 0.008 = 0.8%)",   group = GRP_E2, step = 0.0001, minval = 0.0)
+
+// ── E3 · Momentum Quality ────────────────────────────────────────
+i_e3Enable    = input.bool (true,  "Enable E3 · Candle Efficiency", group = GRP_E3)
+i_minEfficiency = input.float(0.35, "Min Body/Range Efficiency",    group = GRP_E3, minval = 0.2, maxval = 0.9, step = 0.05,
+     tooltip = "Body must be at least this fraction of total range. 0.35 blocks only pure dojis/spikes.")
+i_maxWickRatio  = input.float(0.65, "Max Wick Ratio (total wicks / range)", group = GRP_E3, minval = 0.1, maxval = 0.9, step = 0.05,
+     tooltip = "Sum of upper + lower wicks as fraction of range. 0.65 blocks only extreme wick-dominated candles.")
+
+// ── E4 · HTF EMA Bias ───────────────────────────────────────────
+i_e4Enable    = input.bool (true,  "Enable E4 · HTF EMA Bias",      group = GRP_E4,
+     tooltip = "ON by default. A 1m bull MSS below the 1H EMA will always get crushed by HTF sellers.")
+i_htfTF       = input.timeframe("60", "HTF Timeframe",              group = GRP_E4)
+i_htfEmaLen   = input.int  (21,   "HTF EMA Length",                 group = GRP_E4, minval = 5, maxval = 200)
+i_htfBuffer   = input.float(0.0,  "HTF EMA Buffer (× ATR)",         group = GRP_E4, minval = 0.0, step = 0.05,
+     tooltip = "Price must be this far above/below the EMA to qualify (prevents trading right at the EMA).")
+
+// ── E5 · Displacement Strength Gate ─────────────────────────────
+i_e5Enable    = input.bool (true,  "Enable E5 · Displacement Gate", group = GRP_E5)
+i_minDispMult = input.float(1.5,   "Min Displacement (× avg body)", group = GRP_E5, minval = 1.0, step = 0.1)
+
+// ── E6 · FVG Quality Gate ────────────────────────────────────────
+i_e6Enable      = input.bool (true,  "Enable E6 · FVG Quality Gate",  group = GRP_E6)
+i_minFvgQuality = input.float(0.4,  "Min FVG Size (× ATR)",           group = GRP_E6, minval = 0.1, step = 0.05)
+
+// ── E7 · Entry Confirmation ──────────────────────────────────────
+i_e7Enable     = input.bool (true,  "Enable E7 · Entry Confirmation", group = GRP_E7,
+     tooltip = "ON by default for 1m — prevents entering on a wick graze.")
+i_confirmType  = input.string("Rejection Close", "Confirmation Type",
+     options = ["Rejection Close", "Body Closes Inside Zone", "Either"], group = GRP_E7)
+
+// ── E8 · Cooldown Timer ──────────────────────────────────────────
+i_e8Enable      = input.bool (true,  "Enable E8 · Cooldown Timer",    group = GRP_E8)
+i_cooldownBars  = input.int  (5,     "Cooldown (bars after last trade)", group = GRP_E8, minval = 1, maxval = 100)
+i_maxConsecLoss = input.int  (2,     "Max Consecutive Losses Before Pause", group = GRP_E8, minval = 1, maxval = 5)
+i_lockoutBars   = input.int  (20,    "Lockout Period (bars after streak)",  group = GRP_E8, minval = 5, maxval = 200)
+
+// ── Killzones ────────────────────────────────────────────────────
+i_showLondon  = input.bool (true,  "London KZ  (1–6 AM EST)",       group = GRP_KZ)
+i_showNY      = input.bool (true,  "NY KZ  (8:00 AM–12:30 PM EST)", group = GRP_KZ)
+i_showAsian   = input.bool (true,  "Asian KZ  (7 PM–1 AM EST)",     group = GRP_KZ)
+i_colAsian    = input.color(color.new(#00BFA5, 90), "Asian BG",     group = GRP_KZ)
+i_colLondon   = input.color(color.new(#2962FF, 90), "London BG",    group = GRP_KZ)
+i_colNY       = input.color(color.new(#FF6D00, 90), "NY BG",        group = GRP_KZ)
+i_filterKZ    = input.bool (true,  "Only Signal Inside Killzones",   group = GRP_KZ,
+     tooltip = "STRONGLY recommended ON for 1m. Outside London/NY sessions, 1m MSSs are almost always fake noise sweeps.")
+
+// ── UI ───────────────────────────────────────────────────────────
+i_showLegend    = input.bool (true, "Show Legend Table",    group = GRP_UI)
+i_showDashboard = input.bool (true, "Show Filter Dashboard", group = GRP_UI)
+
+
+//   SHARED UTILITIES                                           
+
+
+atrVal  = ta.atr(i_atrLen)
+avgBody = ta.sma(math.abs(close - open), i_atrLen)
+avgVol  = ta.sma(nz(volume), i_atrLen)
+
+// Pine Script requires all ta.lowest / ta.highest calls to exist at root scope —
+// they cannot be placed inside conditional branches or function bodies.
+slNoiseLow  = ta.lowest (low,  i_slNoiseLen)
+slNoiseHigh = ta.highest(high, i_slNoiseLen)
+
+// Uses the user-defined i_slStructWindow rather than a hardcoded 200-bar value.
+// A 200-bar lookback on a ranging 1m chart anchors the structural extreme to a point
+// 200 minutes in the past, which on a tight pair like AUDCAD could be so far from entry
+// that the resulting stop breaches margin before price ever gets there.
+structHighArr = ta.highest(high, i_slStructWindow)
+structLowArr  = ta.lowest (low,  i_slStructWindow)
+
+// ── Displacement tests ───────────────────────────────────────────
+isDispBarBull() =>
+    body    = math.abs(close - open)
+    volPass = i_useVol ? nz(volume) > avgVol : true
+    close > open and body >= i_dispMult * avgBody and (high - low) >= i_dispMult * atrVal * 0.7 and volPass
+
+isDispBarBear() =>
+    body    = math.abs(close - open)
+    volPass = i_useVol ? nz(volume) > avgVol : true
+    close < open and body >= i_dispMult * avgBody and (high - low) >= i_dispMult * atrVal * 0.7 and volPass
+
+dispRatio() =>
+    body = math.abs(close - open)
+    ab   = nz(avgBody, body)
+    ab > 0 ? body / ab : 1.0
+
+calcConfidence(float strength) =>
+    c = (strength - 1.0) / 2.0
+    math.max(0.0, math.min(1.0, c))
+
+slPadding(float strength) =>
+    conf = calcConfidence(strength)
+    conf >= 0.8 ? i_slPad80 * atrVal : conf >= 0.6 ? i_slPad60 * atrVal : conf >= 0.4 ? i_slPad40 * atrVal : i_slPad20 * atrVal
+
+rrTarget(float strength) =>
+    conf = calcConfidence(strength)
+    conf >= 0.8 ? i_rr80 : conf >= 0.6 ? i_rr60 : conf >= 0.4 ? i_rr40 : i_rr20
+
+// ── Pivot detection ──────────────────────────────────────────────
+pvH = ta.pivothigh(high, i_pivotLen, i_pivotLen)
+pvL = ta.pivotlow (low,  i_pivotLen, i_pivotLen)
+
+var float swHi       = na
+var int   swHiBar    = na
+var float swLo       = na
+var int   swLoBar    = na
+var float prevSwHi   = na
+var float prevSwLo   = na
+var bool  swHiBroken = false
+var bool  swLoBroken = false
+
+var pivHighs    = array.new<float>()
+var pivHighBars = array.new<int>()
+var pivLows     = array.new<float>()
+var pivLowBars  = array.new<int>()
+
+if not na(pvH)
+    prevSwHi   := swHi
+    swHi       := pvH
+    swHiBar    := bar_index - i_pivotLen
+    swHiBroken := false
+    pivHighs.push(pvH)
+    pivHighBars.push(bar_index - i_pivotLen)
+    if pivHighs.size() > 50
+        pivHighs.shift()
+        pivHighBars.shift()
+
+if not na(pvL)
+    prevSwLo   := swLo
+    swLo       := pvL
+    swLoBar    := bar_index - i_pivotLen
+    swLoBroken := false
+    pivLows.push(pvL)
+    pivLowBars.push(bar_index - i_pivotLen)
+    if pivLows.size() > 50
+        pivLows.shift()
+        pivLowBars.shift()
+
+// ── Killzone detection ───────────────────────────────────────────
+estMinutes() =>
+    h = hour(time, "America/New_York")
+    m = minute(time, "America/New_York")
+    h * 60 + m
+
+mins          = estMinutes()
+isLondonKZ    = mins >= 60  and mins < 360
+isNYKZ        = mins >= 480 and mins < 750
+isAsianKZ     = mins >= 1140 or mins < 60
+inKZ          = isLondonKZ or isNYKZ or (i_showAsian and isAsianKZ)
+signalAllowed = i_filterKZ ? inKZ : true
+
+
+//   MODULE E  ·  MARKET CONDITION FILTERS                      
+
+// ── E1 · Market Regime ──────────────────────────────────────────
+recentRange    = ta.highest(high, i_regimeLookback) - ta.lowest(low, i_regimeLookback)
+priorRange     = ta.highest(high, i_regimeLookback * 2)[i_regimeLookback] - ta.lowest(low, i_regimeLookback * 2)[i_regimeLookback]
+e1_inExpansion = not na(priorRange) and priorRange > 0 and recentRange >= i_expansionMult * priorRange
+e1_pass        = not i_e1Enable or not i_enableFilters or e1_inExpansion
+
+// ── E2 · Volatility Band ─────────────────────────────────────────
+atrPct       = close > 0 ? atrVal / close : 0.0
+e2_inVolBand = atrPct >= i_atrPctMin and atrPct <= i_atrPctMax
+e2_pass      = not i_e2Enable or not i_enableFilters or e2_inVolBand
+
+// ── E3 · Candle Efficiency ───────────────────────────────────────
+// Evaluates the bar one step back so we assess the displacement candle cleanly.
+totalRange1      = high[1] - low[1]
+bodySize1        = math.abs(close[1] - open[1])
+upperWick1       = high[1] - math.max(close[1], open[1])
+lowerWick1       = math.min(close[1], open[1]) - low[1]
+totalWick1       = upperWick1 + lowerWick1
+candleEfficiency = totalRange1 > 0 ? bodySize1 / totalRange1 : 0.0
+wickRatio        = totalRange1 > 0 ? totalWick1 / totalRange1 : 1.0
+e3_efficient     = candleEfficiency >= i_minEfficiency and wickRatio <= i_maxWickRatio
+e3_pass          = not i_e3Enable or not i_enableFilters or e3_efficient
+
+// ── E4 · Higher-Timeframe EMA Bias ───────────────────────────────
+// lookahead_off ensures no future data leaks into the signal.
+htfEmaRaw   = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, i_htfEmaLen),    lookahead = barmerge.lookahead_off)
+htfCloseRaw = request.security(syminfo.tickerid, i_htfTF, close,                          lookahead = barmerge.lookahead_off)
+htfEmaPrevR = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, i_htfEmaLen)[1], lookahead = barmerge.lookahead_off)
+htfEma      = nz(htfEmaRaw, close)
+htfClose    = nz(htfCloseRaw, close)
+htfEmaPrev  = nz(htfEmaPrevR, htfEma)
+htfBuffer   = i_htfBuffer * atrVal
+// Compare HTF close vs HTF EMA — stable and not affected by 1m candle flicker.
+htfEmaSlope  = htfEma - htfEmaPrev
+e4_bullBias  = htfClose > htfEma + htfBuffer and htfEmaSlope >= 0
+e4_bearBias  = htfClose < htfEma - htfBuffer and htfEmaSlope <= 0
+e4_pass_bull = not i_e4Enable or not i_enableFilters or e4_bullBias
+e4_pass_bear = not i_e4Enable or not i_enableFilters or e4_bearBias
+
+// ── E5 · Displacement Strength Gate ─────────────────────────────
+// Gate is applied at the moment the MSS fires, not at retest.
+// If the structural break itself was weak, the setup is invalid regardless
+// of how the FVG retest looks later.
+var bool e5_bullGateOpen = false
+var bool e5_bearGateOpen = false
+
+e5_bull_ok(float str) => not i_e5Enable or not i_enableFilters or str >= i_minDispMult
+e5_bear_ok(float str) => not i_e5Enable or not i_enableFilters or str >= i_minDispMult
+
+// ── E6 · FVG Quality Gate ────────────────────────────────────────
+fvgQualityOk(float fvgTop, float fvgBot) =>
+    gapSize = fvgTop - fvgBot
+    not i_e6Enable or not i_enableFilters or gapSize >= i_minFvgQuality * atrVal
+
+// ── E7 · Entry Confirmation ──────────────────────────────────────
+// Called at retest bar:
+//  "Rejection Close"    → candle enters zone but body closes OUTSIDE it.
+//  "Body Closes Inside" → candle body (open/close) is fully inside the zone.
+//  "Either"             → any of the above.
+checkEntryConfirmation(bool isBull, float fvgTop, float fvgBot) =>
+    if not i_e7Enable or not i_enableFilters
+        true
+    else
+        bodyHi        = math.max(close, open)
+        bodyLo        = math.min(close, open)
+        rejectionBull = low <= fvgTop and close > fvgTop
+        rejectionBear = high >= fvgBot and close < fvgBot
+        bodyInsideBull = bodyHi <= fvgTop and bodyLo >= fvgBot
+        bodyInsideBear = bodyHi <= fvgTop and bodyLo >= fvgBot
+        matched = false
+        if i_confirmType == "Rejection Close"
+            matched := isBull ? rejectionBull : rejectionBear
+        else if i_confirmType == "Body Closes Inside Zone"
+            matched := isBull ? bodyInsideBull : bodyInsideBear
+        else
+            matched := isBull ? (rejectionBull or bodyInsideBull) : (rejectionBear or bodyInsideBear)
+        matched
+
+// ── E8 · Cooldown Timer ─────────────────────────────────────────
+var int lastTradeBar    = -999
+cooldownBars_scaled     = i_cooldownBars
+
+// Inline check avoids a forward-reference to lockoutUntil.
+e8_ok_inline()        => not i_e8Enable or not i_enableFilters or (bar_index - lastTradeBar) >= cooldownBars_scaled
+allFiltersOk_common() => e1_pass and e2_pass and e3_pass and e8_ok_inline()
+allFiltersOk_bull()   => allFiltersOk_common() and e4_pass_bull
+allFiltersOk_bear()   => allFiltersOk_common() and e4_pass_bear
+
+showFilterFail(string reason, bool isBull) =>
+    if i_showFilterLbl and i_enableFilters
+        lc = isBull ? color.new(color.aqua, 60) : color.new(color.orange, 60)
+        ls = isBull ? label.style_label_up : label.style_label_down
+        yp = isBull ? low - atrVal * 0.5 : high + atrVal * 0.5
+        label.new(bar_index, yp, "✕ " + reason,
+             color = lc, textcolor = color.white, style = ls, size = size.tiny)
+
+
+//   MODULE A  ·  LIQUIDITY SWEEPS                              
+
+
+var float lastBslWickHi = na
+var int   lastBslBar    = na
+var label lastBslLbl    = na
+var float lastSslWickLo = na
+var int   lastSslBar    = na
+var label lastSslLbl    = na
+
+bool gotBSL = false
+bool gotSSL = false
+
+if barstate.isconfirmed
+    sweepMin = i_sweepMargin * atrVal
+    if not na(swHi) and high > swHi + sweepMin and close <= swHi
+        gotBSL        := true
+        lastBslWickHi := high
+        lastBslBar    := bar_index
+        if i_showA
+            lastBslLbl := label.new(bar_index, high, "BSL ↑",
+                 color = i_colBSL, textcolor = color.black,
+                 style = label.style_label_down, size = size.small)
+    if not na(swLo) and low < swLo - sweepMin and close >= swLo
+        gotSSL        := true
+        lastSslWickLo := low
+        lastSslBar    := bar_index
+        if i_showA
+            lastSslLbl := label.new(bar_index, low, "SSL ↓",
+                 color = i_colSSL, textcolor = color.black,
+                 style = label.style_label_up, size = size.small)
+
+
+//   MODULE B  ·  MARKET STRUCTURE  (BOS / MSS)                 
+
+
+var int   lastSslMssLinked = -1
+var int   lastBslMssLinked = -1
+var int   lastMssBullBar   = na
+var float lastMssBullLow   = na
+var float lastMssDispStr   = na
+var label lastMssBullLbl   = na
+var line  lastMssBullLine  = na
+var int   lastMssBearBar   = na
+var float lastMssBearHi    = na
+var float lastMssBearDisp  = na
+var label lastMssBearLbl   = na
+var line  lastMssBearLine  = na
+
+bool mssBull = false
+bool mssBear = false
+
+if barstate.isconfirmed
+    sslRecent = not na(lastSslBar) and bar_index - lastSslBar <= i_maxBars
+    if not swHiBroken and sslRecent and lastSslMssLinked != lastSslBar and not na(swHi) and close > swHi and isDispBarBull()
+        mssBull           := true
+        swHiBroken        := true
+        lastSslMssLinked  := lastSslBar
+        lastMssBullBar    := bar_index
+        lastMssBullLow    := low
+        lastMssDispStr    := dispRatio()
+        if i_showB
+            lastMssBullLbl  := label.new(bar_index, high, "MSS",
+                 color = i_colMSS, textcolor = color.white,
+                 style = label.style_label_down, size = size.small)
+            lastMssBullLine := line.new(bar_index - 1, swHi, bar_index + i_maxBars, swHi,
+                 color = i_colMSS, style = line.style_dashed, width = 1)
+
+    bslRecent = not na(lastBslBar) and bar_index - lastBslBar <= i_maxBars
+    if not swLoBroken and bslRecent and lastBslMssLinked != lastBslBar and not na(swLo) and close < swLo and isDispBarBear()
+        mssBear           := true
+        swLoBroken        := true
+        lastBslMssLinked  := lastBslBar
+        lastMssBearBar    := bar_index
+        lastMssBearHi     := high
+        lastMssBearDisp   := dispRatio()
+        if i_showB
+            lastMssBearLbl  := label.new(bar_index, low, "MSS",
+                 color = i_colMSS, textcolor = color.white,
+                 style = label.style_label_up, size = size.small)
+            lastMssBearLine := line.new(bar_index - 1, swLo, bar_index + i_maxBars, swLo,
+                 color = i_colMSS, style = line.style_dashed, width = 1)
+
+    if not swHiBroken and not mssBull and not na(swHi) and not na(prevSwHi) and close > swHi
+        swHiBroken := true
+        if i_showB
+            label.new(bar_index, high, "BOS",
+                 color = i_colBOS, textcolor = color.white,
+                 style = label.style_label_down, size = size.tiny)
+    if not swLoBroken and not mssBear and not na(swLo) and not na(prevSwLo) and close < swLo
+        swLoBroken := true
+        if i_showB
+            label.new(bar_index, low, "BOS",
+                 color = i_colBOS, textcolor = color.white,
+                 style = label.style_label_up, size = size.tiny)
+
+
+//   MODULE C  ·  DISPLACEMENT FAIR VALUE GAPS      
+
+
+var fvgArr = array.new<FVGZone>()
+var FVGZone tmpFvg = FVGZone.new(0.0, 0.0, true, 0, box.new(na, na, na, na), false, false, 0.0)
+
+createFVGBox(float t, float b, bool isBull) =>
+    fc  = isBull ? i_colFVGBullF : i_colFVGBearF
+    bc  = isBull ? i_colFVGBullB : i_colFVGBearB
+    ext = i_extendFVG ? extend.right : extend.none
+    box.new(bar_index - 2, t, bar_index, b,
+         border_color = bc, border_width = 1, bgcolor = fc, extend = ext)
+
+if barstate.isconfirmed
+    midBody = math.abs(close[1] - open[1])
+    midAvg  = nz(avgBody[1], midBody)
+    midStr  = midAvg > 0 ? midBody / midAvg : 1.0
+    minGap  = i_minFvgAtr * atrVal
+
+    bullTop = low
+    bullBot = high[2]
+    if bullTop > bullBot + minGap and close[1] > open[1]
+        bx   = createFVGBox(bullTop, bullBot, true)
+        zone = FVGZone.new(bullTop, bullBot, true, bar_index - 2, bx, false, true, midStr)
+        fvgArr.push(zone)
+        if not i_showC
+            bx.set_bgcolor(color.new(color.black, 100))
+            bx.set_border_color(color.new(color.black, 100))
+
+    bearTop = low[2]
+    bearBot = high
+    if bearTop > bearBot + minGap and close[1] < open[1]
+        bx   = createFVGBox(bearTop, bearBot, false)
+        zone = FVGZone.new(bearTop, bearBot, false, bar_index - 2, bx, false, true, midStr)
+        fvgArr.push(zone)
+        if not i_showC
+            bx.set_bgcolor(color.new(color.black, 100))
+            bx.set_border_color(color.new(color.black, 100))
+
+if barstate.isconfirmed and fvgArr.size() > 0
+    for i = fvgArr.size() - 1 to 0
+        z = fvgArr.get(i)
+        if z.mitigated
+            continue
+        if bar_index > z.startBar + 2
+            if z.isBull and low <= z.top
+                z.mitigated := true
+                if i_deleteMit
+                    z.bx.delete()
+                else
+                    z.bx.set_right(bar_index)
+                    z.bx.set_extend(extend.none)
+            if not z.isBull and high >= z.bot
+                z.mitigated := true
+                if i_deleteMit
+                    z.bx.delete()
+                else
+                    z.bx.set_right(bar_index)
+                    z.bx.set_extend(extend.none)
+    if fvgArr.size() > 200
+        for i = fvgArr.size() - 1 to 0
+            if fvgArr.get(i).mitigated
+                fvgArr.remove(i)
+                if fvgArr.size() <= 150
+                    break
+
+
+//   MODULE D  ·  TJR ENTRY MODEL  (Confluence + RR)            
+
+
+var int   bState    = 0
+var float bSweepLo  = na
+var int   bSweepBar = na
+var float bEntryTop = na
+var float bEntryBot = na
+var int   bFvgIdx   = -1
+var int   bFvgStart = na
+var float bDispStr  = na
+var int   bMssBar   = na
+var label bSweepLbl = na
+var label bMssLbl   = na
+var line  bMssLn    = na
+
+var int   sState    = 0
+var float sSweepHi  = na
+var int   sSweepBar = na
+var float sEntryTop = na
+var float sEntryBot = na
+var int   sFvgIdx   = -1
+var int   sFvgStart = na
+var float sDispStr  = na
+var int   sMssBar   = na
+var label sSweepLbl = na
+var label sMssLbl   = na
+var line  sMssLn    = na
+
+findMssFVG(bool isBull, int mssBar) =>
+    result = -1
+    if fvgArr.size() > 0
+        for i = fvgArr.size() - 1 to 0
+            z = fvgArr.get(i)
+            if z.isBull == isBull and not z.mitigated and z.hasDisplacement
+                if z.startBar >= mssBar - 1 and z.startBar <= mssBar + 1
+                    result := i
+                    break
+    result
+
+isTPClear(bool isBull, float entry, float sl, float curRR) =>
+    risk  = math.abs(entry - sl)
+    tp    = isBull ? entry + curRR * risk : entry - curRR * risk
+    clear = true
+    if isBull and pivHighs.size() > 0
+        for i = pivHighs.size() - 1 to 0
+            p = pivHighs.get(i)
+            if p > entry and p < tp
+                clear := false
+                break
+    if not isBull and pivLows.size() > 0
+        for i = pivLows.size() - 1 to 0
+            p = pivLows.get(i)
+            if p < entry and p > tp
+                clear := false
+                break
+    clear
+
+voidBullVisuals() =>
+    if not na(bSweepLbl)
+        bSweepLbl.delete()
+    if not na(bMssLbl)
+        bMssLbl.delete()
+    if not na(bMssLn)
+        bMssLn.delete()
+
+voidBearVisuals() =>
+    if not na(sSweepLbl)
+        sSweepLbl.delete()
+    if not na(sMssLbl)
+        sMssLbl.delete()
+    if not na(sMssLn)
+        sMssLn.delete()
+
+confLabel(float strength) =>
+    conf = calcConfidence(strength)
+    str.tostring(conf * 100, "#") + "%"
+
+
+//  LIVE TRADE TRACKING  (for break-even and trail logic)
+
+
+var bool  tradeActive  = false
+var int   consecLosses = 0
+var int   lockoutUntil = -999
+var bool  inLong       = false
+var bool  inShort      = false
+var float tEntry       = na
+var float tSL          = na
+var float tTP          = na
+var float tOrigTP      = na
+var float tOrigRisk    = na
+var bool  tBEDone      = false
+var bool  tTrailDone   = false
+
+// Progress tracking uses close-based values only — wick-based progress would trigger
+// break-even and trail at prices that cannot actually be filled on bar close.
+if barstate.isconfirmed
+    // ══ LONG management ══════════════════════════════════════════
+    if inLong and not na(tEntry) and not na(tTP) and not na(tSL)
+        origDist  = math.abs(tOrigTP - tEntry)
+        progressC = origDist > 0 ? (close - tEntry) / origDist : 0.0
+
+        // Stage 1: close crossed 40% of the way to TP — move SL to entry (break-even)
+        if i_useBE and not tBEDone and progressC >= 0.40
+            tSL     := tEntry
+            tBEDone := true
+            strategy.exit("EXIT LONG", "LONG", stop = tSL, limit = tTP)
+
+        // Stage 2: close crossed 80% of the way to TP — lock SL at original TP
+        // and extend the target to the trail multiplier distance
+        if i_useTrail and not tTrailDone and progressC >= 0.80
+            tSL        := tOrigTP
+            tTP        := tEntry + i_trailTpMult * origDist
+            tTrailDone := true
+            strategy.exit("EXIT LONG", "LONG", stop = tSL, limit = tTP)
+
+        // Stage 3: after trail triggers, SL follows every new higher close,
+        // always keeping i_trailAtr ATR of breathing room underneath it
+        if i_useTrail and tTrailDone
+            trailLevel = close - (i_trailAtr * atrVal)
+            if trailLevel > tSL
+                tSL := trailLevel
+                strategy.exit("EXIT LONG", "LONG", stop = tSL, limit = tTP)
+
+        if strategy.position_size <= 0
+            if strategy.wintrades > strategy.wintrades[1]
+                consecLosses := 0
+            else if strategy.losstrades > strategy.losstrades[1]
+                consecLosses := consecLosses + 1
+                if consecLosses >= i_maxConsecLoss
+                    lockoutUntil := bar_index + i_lockoutBars
+                    consecLosses := 0
+            inLong      := false
+            tradeActive := false
+            tEntry      := na
+            tSL         := na
+            tTP         := na
+            tOrigTP     := na
+            tOrigRisk   := na
+            tBEDone     := false
+            tTrailDone  := false
+
+    // ══ SHORT management ═════════════════════════════════════════
+    if inShort and not na(tEntry) and not na(tTP) and not na(tSL)
+        origDist  = math.abs(tEntry - tOrigTP)
+        progressC = origDist > 0 ? (tEntry - close) / origDist : 0.0
+
+        // Stage 1: break-even
+        if i_useBE and not tBEDone and progressC >= 0.40
+            tSL     := tEntry
+            tBEDone := true
+            strategy.exit("EXIT SHORT", "SHORT", stop = tSL, limit = tTP)
+
+        // Stage 2: lock and extend
+        if i_useTrail and not tTrailDone and progressC >= 0.80
+            tSL        := tOrigTP
+            tTP        := tEntry - i_trailTpMult * origDist
+            tTrailDone := true
+            strategy.exit("EXIT SHORT", "SHORT", stop = tSL, limit = tTP)
+
+        // Stage 3: continuous trail — SL follows every new lower close,
+        // always keeping i_trailAtr ATR of breathing room above it
+        if i_useTrail and tTrailDone
+            trailLevel = close + (i_trailAtr * atrVal)
+            if trailLevel < tSL
+                tSL := trailLevel
+                strategy.exit("EXIT SHORT", "SHORT", stop = tSL, limit = tTP)
+
+        if strategy.position_size >= 0
+            if strategy.wintrades > strategy.wintrades[1]
+                consecLosses := 0
+            else if strategy.losstrades > strategy.losstrades[1]
+                consecLosses := consecLosses + 1
+                if consecLosses >= i_maxConsecLoss
+                    lockoutUntil := bar_index + i_lockoutBars
+                    consecLosses := 0
+            inShort     := false
+            tradeActive := false
+            tEntry      := na
+            tSL         := na
+            tTP         := na
+            tOrigTP     := na
+            tOrigRisk   := na
+            tBEDone     := false
+            tTrailDone  := false
+
+
+//  BULL SETUP MACHINE
+
+
+if barstate.isconfirmed and i_showD
+
+    // tradeActive is checked at the very top of the block, before any state transition.
+    // Pine Script evaluates both state machines in sequence on the same bar. If we only
+    // checked tradeActive inside the signal block, the bear machine could still read
+    // tradeActive = false on a bar where the bull machine just fired — because the flag
+    // was set after strategy.entry() in the old code. Setting it before entry() and
+    // checking it here ensures only one trade can ever open per bar.
+    if bState == 0 and gotSSL and not tradeActive
+        bState    := 1
+        bSweepLo  := lastSslWickLo
+        bSweepBar := lastSslBar
+        bSweepLbl := lastSslLbl
+
+    if bState == 1 and (bar_index - bSweepBar > i_maxBars or tradeActive)
+        voidBullVisuals()
+        bState  := 0
+        bFvgIdx := -1
+
+    if bState == 1
+        if low < bSweepLo
+            voidBullVisuals()
+            bState := 0
+        else if mssBull
+            mssDispStr = nz(lastMssDispStr, 1.5)
+            if not e5_bull_ok(mssDispStr)
+                showFilterFail("E5:Disp", true)
+                voidBullVisuals()
+                bState := 0
+            else
+                bState   := 2
+                bFvgIdx  := -1
+                bDispStr := mssDispStr
+                bMssBar  := bar_index
+                bMssLbl  := lastMssBullLbl
+                bMssLn   := lastMssBullLine
+
+    if bState == 2 and (bar_index - bMssBar > i_maxBars or tradeActive)
+        if bFvgIdx >= 0 and bFvgIdx < fvgArr.size()
+            tmpFvg           := fvgArr.get(bFvgIdx)
+            tmpFvg.mitigated := true
+        bFvgIdx := -1
+        voidBullVisuals()
+        bState := 0
+
+    if bState == 2
+        if low < bSweepLo
+            voidBullVisuals()
+            bState := 0
+        else if i_strictOpp and not na(lastBslWickHi) and close > lastBslWickHi
+            voidBullVisuals()
+            bState := 0
+        else
+            if bFvgIdx == -1
+                fi = findMssFVG(true, bMssBar)
+                if fi >= 0
+                    // Discard the zone immediately at discovery if it is too small,
+                    // rather than waiting until retest to reject it.
+                    fTop = fvgArr.get(fi).top
+                    fBot = fvgArr.get(fi).bot
+                    if not fvgQualityOk(fTop, fBot)
+                        showFilterFail("E6:FVGSize", true)
+                        voidBullVisuals()
+                        bState := 0
+                    else
+                        bFvgIdx   := fi
+                        bEntryTop := fTop
+                        bEntryBot := fBot
+                        bFvgStart := fvgArr.get(fi).startBar
+
+            bullRetestClose = close <= bEntryTop and close >= bEntryBot
+            bullRetestWick  = low <= bEntryTop and close > bEntryTop
+
+            if bFvgIdx != -1 and bar_index > bFvgStart + 2 and (bullRetestClose or bullRetestWick) and signalAllowed and not tradeActive
+                inLockoutNow = i_e8Enable and i_enableFilters and bar_index < lockoutUntil
+                if not allFiltersOk_bull() or inLockoutNow
+                    reason = not e1_pass ? "E1:Regime" : not e2_pass ? "E2:Volat" : not e3_pass ? "E3:Effic" : not e4_pass_bull ? "E4:HTFBias" : inLockoutNow ? "E8:Lockout" : "E8:Cooldown"
+                    showFilterFail(reason, true)
+                    if bFvgIdx >= 0 and bFvgIdx < fvgArr.size()
+                        tmpFvg           := fvgArr.get(bFvgIdx)
+                        tmpFvg.mitigated := true
+                    bFvgIdx := -1
+                    voidBullVisuals()
+                    bState := 0
+                else
+                    // If the retest candle has not yet confirmed, stay in state 2
+                    // and wait for the next bar rather than entering on a wick graze.
+                    if not checkEntryConfirmation(true, bEntryTop, bEntryBot)
+                        true
+                    else
+                        pad     = slPadding(bDispStr)
+                        confVal = calcConfidence(bDispStr)
+
+                        // Place the structural SL below the minimum of the sweep wick
+                        // and the bounded structural low window. The 0.3 ATR buffer adds
+                        // a small safety margin so the stop is not placed exactly on the extreme.
+                        sweepBaseSL = math.min(bSweepLo, structLowArr) - pad - (0.3 * atrVal)
+                        sl          = i_useFixedSL ? bEntryTop - i_fixedSLAtr * atrVal : sweepBaseSL
+                        entry       = bEntryTop
+                        risk        = math.abs(entry - sl)
+
+                        // Enforce minimum distance so market noise cannot trigger the stop immediately.
+                        minAllowedRisk = i_minRiskATR * atrVal
+                        if not i_useFixedSL and risk < minAllowedRisk
+                            sl   := entry - minAllowedRisk
+                            risk := math.abs(entry - sl)
+
+                        // SL must be strictly below entry for longs.
+                        if sl >= entry
+                            sl   := entry - minAllowedRisk
+                            risk := math.abs(entry - sl)
+
+                        // Hard cap: if the structural window still produces a stop wider
+                        // than the ATR maximum, clamp it to prevent margin calls.
+                        maxAllowedRisk = i_maxSlAtr * atrVal
+                        if risk > maxAllowedRisk
+                            sl   := entry - maxAllowedRisk
+                            risk := maxAllowedRisk
+
+                        curRR     = rrTarget(confVal)
+                        tp        = entry + curRR * risk
+                        maxTpDist = i_maxTpAtr * atrVal
+                        tpDist    = math.abs(tp - entry)
+                        if tpDist > maxTpDist
+                            tp    := entry + maxTpDist
+                            curRR := maxTpDist / risk
+
+                        clear = i_useOpPivotCheck ? isTPClear(true, entry, sl, curRR) : true
+
+                        if risk > 0 and clear
+                            // tradeActive is set to true BEFORE strategy.entry() is called.
+                            // This ensures the bear state machine — which runs immediately after
+                            // on the same bar — will see tradeActive = true and skip its own
+                            // signal check, preventing simultaneous entries and margin calls.
+                            tradeActive := true
+                            inLong      := true
+                            inShort     := false
+                            tEntry      := entry
+                            tSL         := sl
+                            tTP         := tp
+                            tOrigTP     := tp
+                            tOrigRisk   := risk
+                            tBEDone     := false
+                            tTrailDone  := false
+
+                            strategy.entry("LONG", strategy.long)
+                            strategy.exit("EXIT LONG", "LONG", stop = sl, limit = tp)
+                            lastTradeBar := bar_index
+
+                            conf = confLabel(bDispStr)
+                            label.new(bar_index, low,
+                                 "▲ BUY  " + conf + "\nRR 1:" + str.tostring(curRR, "#.##"),
+                                 color = i_colBuy, textcolor = color.white,
+                                 style = label.style_label_up, size = size.normal)
+                            if i_showSL
+                                line.new(bar_index, sl, bar_index + i_tpExtBars, sl,
+                                     color = color.new(color.red, 30), style = line.style_dashed, width = 2)
+                                label.new(bar_index + i_tpExtBars, sl, "SL",
+                                     color = color.new(color.red, 60), textcolor = color.white,
+                                     style = label.style_label_left, size = size.tiny)
+                            if i_showTP
+                                line.new(bar_index, tp, bar_index + i_tpExtBars, tp,
+                                     color = color.new(color.lime, 30), style = line.style_dashed, width = 2)
+                                label.new(bar_index + i_tpExtBars, tp, "TP",
+                                     color = color.new(color.lime, 60), textcolor = color.white,
+                                     style = label.style_label_left, size = size.tiny)
+                            bState := 3
+                        else
+                            voidBullVisuals()
+                            bState := 0
+
+    if bState == 3
+        bState := 0
+
+
+//  BEAR SETUP MACHINE
+
+
+if barstate.isconfirmed and i_showD
+
+    // Same tradeActive guard as the bull machine — if the bull machine already set
+    // tradeActive = true earlier this bar, no bear setup can begin.
+    if sState == 0 and gotBSL and not tradeActive
+        sState    := 1
+        sSweepHi  := lastBslWickHi
+        sSweepBar := lastBslBar
+        sSweepLbl := lastBslLbl
+
+    if sState == 1 and (bar_index - sSweepBar > i_maxBars or tradeActive)
+        voidBearVisuals()
+        sState  := 0
+        sFvgIdx := -1
+
+    if sState == 1
+        if high > sSweepHi
+            voidBearVisuals()
+            sState := 0
+        else if mssBear
+            mssDispStr = nz(lastMssBearDisp, 1.5)
+            if not e5_bear_ok(mssDispStr)
+                showFilterFail("E5:Disp", false)
+                voidBearVisuals()
+                sState := 0
+            else
+                sState   := 2
+                sFvgIdx  := -1
+                sDispStr := mssDispStr
+                sMssBar  := bar_index
+                sMssLbl  := lastMssBearLbl
+                sMssLn   := lastMssBearLine
+
+    if sState == 2 and (bar_index - sMssBar > i_maxBars or tradeActive)
+        if sFvgIdx >= 0 and sFvgIdx < fvgArr.size()
+            tmpFvg           := fvgArr.get(sFvgIdx)
+            tmpFvg.mitigated := true
+        sFvgIdx := -1
+        voidBearVisuals()
+        sState := 0
+
+    if sState == 2
+        if high > sSweepHi
+            voidBearVisuals()
+            sState := 0
+        else if i_strictOpp and not na(lastSslWickLo) and close < lastSslWickLo
+            voidBearVisuals()
+            sState := 0
+        else
+            if sFvgIdx == -1
+                fi = findMssFVG(false, sMssBar)
+                if fi >= 0
+                    fTop = fvgArr.get(fi).top
+                    fBot = fvgArr.get(fi).bot
+                    if not fvgQualityOk(fTop, fBot)
+                        showFilterFail("E6:FVGSize", false)
+                        voidBearVisuals()
+                        sState := 0
+                    else
+                        sFvgIdx   := fi
+                        sEntryTop := fTop
+                        sEntryBot := fBot
+                        sFvgStart := fvgArr.get(fi).startBar
+
+            bearRetestClose = close >= sEntryBot and close <= sEntryTop
+            bearRetestWick  = high >= sEntryBot and close < sEntryBot
+
+            if sFvgIdx != -1 and bar_index > sFvgStart + 2 and (bearRetestClose or bearRetestWick) and signalAllowed and not tradeActive
+                inLockoutNow = i_e8Enable and i_enableFilters and bar_index < lockoutUntil
+                if not allFiltersOk_bear() or inLockoutNow
+                    reason = not e1_pass ? "E1:Regime" : not e2_pass ? "E2:Volat" : not e3_pass ? "E3:Effic" : not e4_pass_bear ? "E4:HTFBias" : inLockoutNow ? "E8:Lockout" : "E8:Cooldown"
+                    showFilterFail(reason, false)
+                    if sFvgIdx >= 0 and sFvgIdx < fvgArr.size()
+                        tmpFvg           := fvgArr.get(sFvgIdx)
+                        tmpFvg.mitigated := true
+                    sFvgIdx := -1
+                    voidBearVisuals()
+                    sState := 0
+                else
+                    if not checkEntryConfirmation(false, sEntryTop, sEntryBot)
+                        true
+                    else
+                        pad     = slPadding(sDispStr)
+                        confVal = calcConfidence(sDispStr)
+
+                        // Place the structural SL above the maximum of the sweep wick and
+                        // the bounded structural high window. Using the full 200-bar window
+                        // here previously caused the SL on bear trades to sit so far above
+                        // entry on ranging AUDCAD that the broker's margin system fired
+                        // immediately, producing the margin-call clusters seen in testing.
+                        sweepBaseSL = math.max(sSweepHi, structHighArr) + pad + (0.3 * atrVal)
+                        sl          = i_useFixedSL ? sEntryBot + i_fixedSLAtr * atrVal : sweepBaseSL
+                        entry       = sEntryBot
+                        risk        = math.abs(sl - entry)
+
+                        minAllowedRisk = i_minRiskATR * atrVal
+                        if not i_useFixedSL and risk < minAllowedRisk
+                            sl   := entry + minAllowedRisk
+                            risk := math.abs(sl - entry)
+
+                        // SL must be strictly above entry for shorts.
+                        if sl <= entry
+                            sl   := entry + minAllowedRisk
+                            risk := math.abs(sl - entry)
+
+                        // Same hard cap as the bull side.
+                        maxAllowedRisk = i_maxSlAtr * atrVal
+                        if risk > maxAllowedRisk
+                            sl   := entry + maxAllowedRisk
+                            risk := maxAllowedRisk
+
+                        curRR     = rrTarget(confVal)
+                        tp        = entry - curRR * risk
+                        maxTpDist = i_maxTpAtr * atrVal
+                        tpDist    = math.abs(entry - tp)
+                        if tpDist > maxTpDist
+                            tp    := entry - maxTpDist
+                            curRR := maxTpDist / risk
+
+                        clear = i_useOpPivotCheck ? isTPClear(false, entry, sl, curRR) : true
+
+                        if risk > 0 and clear
+                            // tradeActive set before strategy.entry() — same reasoning as
+                            // the bull machine. Prevents the bull machine from re-evaluating
+                            // on this bar if it somehow reaches the signal block again.
+                            tradeActive := true
+                            inShort     := true
+                            inLong      := false
+                            tEntry      := entry
+                            tSL         := sl
+                            tTP         := tp
+                            tOrigTP     := tp
+                            tOrigRisk   := risk
+                            tBEDone     := false
+                            tTrailDone  := false
+
+                            strategy.entry("SHORT", strategy.short)
+                            strategy.exit("EXIT SHORT", "SHORT", stop = sl, limit = tp)
+                            lastTradeBar := bar_index
+
+                            conf = confLabel(sDispStr)
+                            label.new(bar_index, high,
+                                 "▼ SELL  " + conf + "\nRR 1:" + str.tostring(curRR, "#.##"),
+                                 color = i_colSell, textcolor = color.white,
+                                 style = label.style_label_down, size = size.normal)
+                            if i_showSL
+                                line.new(bar_index, sl, bar_index + i_tpExtBars, sl,
+                                     color = color.new(color.red, 30), style = line.style_dashed, width = 2)
+                                label.new(bar_index + i_tpExtBars, sl, "SL",
+                                     color = color.new(color.red, 60), textcolor = color.white,
+                                     style = label.style_label_left, size = size.tiny)
+                            if i_showTP
+                                line.new(bar_index, tp, bar_index + i_tpExtBars, tp,
+                                     color = color.new(color.lime, 30), style = line.style_dashed, width = 2)
+                                label.new(bar_index + i_tpExtBars, tp, "TP",
+                                     color = color.new(color.lime, 60), textcolor = color.white,
+                                     style = label.style_label_left, size = size.tiny)
+                            sState := 3
+                        else
+                            voidBearVisuals()
+                            sState := 0
+
+    if sState == 3
+        sState := 0
+
+
+//  KILLZONE BACKGROUNDS                                       
+
+
+bgcolor(i_showAsian  and isAsianKZ  ? i_colAsian  : na, title = "Asian KZ BG")
+bgcolor(i_showLondon and isLondonKZ ? i_colLondon : na, title = "London KZ BG")
+bgcolor(i_showNY     and isNYKZ     ? i_colNY     : na, title = "NY KZ BG")
+
+
+//   FILTER DASHBOARD  (Bottom-Left)                            
+
+
+passColor(bool p) => p ? color.new(#00E676, 20) : color.new(#FF1744, 20)
+passText(bool p)  => p ? "✓" : "✗"
+
+if i_showDashboard and i_enableFilters and barstate.islast
+    var dash = table.new(position.bottom_left, 3, 11,
+                 bgcolor      = color.new(#0D1117, 10),
+                 border_color = color.new(#30363D, 50),
+                 border_width = 1,
+                 frame_color  = color.new(#58A6FF, 40),
+                 frame_width  = 2)
+
+    table.cell(dash, 0, 0, "Filter",
+         text_color = color.new(#58A6FF, 0), text_size = size.small,
+         bgcolor = color.new(#161B22, 0), text_halign = text.align_center)
+    table.cell(dash, 1, 0, "Status",
+         text_color = color.new(#58A6FF, 0), text_size = size.small,
+         bgcolor = color.new(#161B22, 0), text_halign = text.align_center)
+    table.cell(dash, 2, 0, "Value",
+         text_color = color.new(#58A6FF, 0), text_size = size.small,
+         bgcolor = color.new(#161B22, 0), text_halign = text.align_center)
+
+    table.cell(dash, 0, 1, "E1 Regime",      text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 1, passText(e1_pass), text_color = color.white, text_size = size.small, bgcolor = passColor(e1_pass))
+    table.cell(dash, 2, 1, str.tostring(recentRange / math.max(priorRange, 0.0001), "#.##") + "×",
+         text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+    table.cell(dash, 0, 2, "E2 Volatility",  text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 2, passText(e2_pass), text_color = color.white, text_size = size.small, bgcolor = passColor(e2_pass))
+    table.cell(dash, 2, 2, str.tostring(atrPct * 10000, "#.#") + "‱",
+         text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+    table.cell(dash, 0, 3, "E3 Efficiency",  text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 3, passText(e3_pass), text_color = color.white, text_size = size.small, bgcolor = passColor(e3_pass))
+    table.cell(dash, 2, 3, str.tostring(candleEfficiency * 100, "#") + "% body",
+         text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+    table.cell(dash, 0, 4, "E4 HTF EMA",     text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    htfBiasPass = e4_bullBias or e4_bearBias
+    table.cell(dash, 1, 4, passText(htfBiasPass), text_color = color.white, text_size = size.small, bgcolor = passColor(htfBiasPass))
+    htfSide = e4_bullBias ? "▲ BULL" : e4_bearBias ? "▼ BEAR" : "NEUTRAL"
+    table.cell(dash, 2, 4, htfSide,
+         text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+    e5_dispPass = nz(lastMssDispStr, 0) >= i_minDispMult
+    table.cell(dash, 0, 5, "E5 Disp Str",    text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 5, passText(e5_dispPass), text_color = color.white, text_size = size.small, bgcolor = passColor(e5_dispPass))
+    table.cell(dash, 2, 5, str.tostring(nz(lastMssDispStr, 0), "#.##") + "×",
+         text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+    lastFvgGap = 0.0
+    if fvgArr.size() > 0
+        for i = fvgArr.size() - 1 to 0
+            z = fvgArr.get(i)
+            if not z.mitigated
+                lastFvgGap := z.top - z.bot
+                break
+    e6_fvgPass = lastFvgGap >= i_minFvgQuality * atrVal
+    table.cell(dash, 0, 6, "E6 FVG Gap",     text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 6, passText(e6_fvgPass), text_color = color.white, text_size = size.small, bgcolor = passColor(e6_fvgPass))
+    table.cell(dash, 2, 6, str.tostring(lastFvgGap / math.max(atrVal, 0.0001), "#.##") + "× ATR",
+         text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+    table.cell(dash, 0, 7, "E7 Confirm",     text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 7, i_e7Enable ? "ON" : "OFF", text_color = color.white, text_size = size.small,
+         bgcolor = i_e7Enable ? color.new(color.teal, 30) : color.new(color.gray, 50))
+    table.cell(dash, 2, 7, i_confirmType,
+         text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+    barsSinceTrade = bar_index - lastTradeBar
+    e8_pass_now    = barsSinceTrade >= cooldownBars_scaled and bar_index >= lockoutUntil
+    inLockout      = bar_index < lockoutUntil
+    e8Label        = inLockout ? "LOCKED " + str.tostring(lockoutUntil - bar_index) + "b" : str.tostring(barsSinceTrade) + "/" + str.tostring(cooldownBars_scaled) + "b"
+    table.cell(dash, 0, 8, "E8 Cooldown",    text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 8, passText(e8_pass_now), text_color = color.white, text_size = size.small, bgcolor = inLockout ? color.new(color.red, 20) : passColor(e8_pass_now))
+    table.cell(dash, 2, 8, e8Label,          text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+    modeColor = i_filterMode == "Conservative" ? color.new(color.teal, 20) :
+         i_filterMode == "Aggressive" ? color.new(color.orange, 20) :
+         color.new(color.blue, 20)
+    table.cell(dash, 0, 9, "Mode",           text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 9, i_filterMode,     text_color = color.white, text_size = size.small, bgcolor = modeColor)
+    table.cell(dash, 2, 9, i_enableFilters ? "ACTIVE" : "BYPASSED",
+         text_color = color.white, text_size = size.small,
+         bgcolor = i_enableFilters ? color.new(color.green, 30) : color.new(color.gray, 30))
+
+    table.cell(dash, 0, 10, "Killzone",      text_color = color.new(#E6EDF3, 0), text_size = size.small)
+    table.cell(dash, 1, 10, passText(inKZ),  text_color = color.white, text_size = size.small, bgcolor = passColor(inKZ))
+    kzLabel = isLondonKZ ? "London" : isNYKZ ? "New York" : "Off"
+    table.cell(dash, 2, 10, kzLabel,         text_color = color.new(#E6EDF3, 0), text_size = size.small)
+
+
+//   LEGEND TABLE  (Top-Right)                                  
+
+
+addRow(table tbl, int r, string term, string def) =>
+    table.cell(tbl, 0, r, term,
+         text_color = color.new(#FFD700, 0), text_size = size.small,
+         text_halign = text.align_right)
+    table.cell(tbl, 1, r, def,
+         text_color = color.new(#E6EDF3, 0), text_size = size.small,
+         text_halign = text.align_left)
+
+if i_showLegend and barstate.islast
+    var tbl = table.new(position.top_right, 2, 18,
+                 bgcolor      = color.new(#0D1117, 10),
+                 border_color = color.new(#30363D, 50),
+                 border_width = 1,
+                 frame_color  = color.new(#58A6FF, 40),
+                 frame_width  = 2)
+
+    table.cell(tbl, 0, 0, "◈  TJR PA Enhanced",
+         text_color = color.new(#58A6FF, 0), text_size = size.small,
+         bgcolor = color.new(#161B22, 0), text_halign = text.align_center)
+    table.cell(tbl, 1, 0, "Legend",
+         text_color = color.new(#58A6FF, 0), text_size = size.small,
+         bgcolor = color.new(#161B22, 0), text_halign = text.align_center)
+
+    addRow(tbl, 1,  "BSL",   "Buy-Side Liquidity swept (SMC)")
+    addRow(tbl, 2,  "SSL",   "Sell-Side Liquidity swept (SMC)")
+    addRow(tbl, 3,  "MSS",   "Market Structure Shift (SMC)")
+    addRow(tbl, 4,  "BOS",   "Break of Structure")
+    addRow(tbl, 5,  "FVG",   "Fair Value Gap (3-candle)")
+    addRow(tbl, 6,  "DISP",  "Displacement ≥" + str.tostring(i_dispMult, "#.#") + "× body")
+    addRow(tbl, 7,  "RR",    "Dynamic: 1.0 to 3.0 based on Conf")
+    addRow(tbl, 8,  "KZ",    "London 1–6 / NY 8:00–12:30 EST")
+    addRow(tbl, 9,  "Conf",  "0.0 to 1.0 (from Displacement Math)")
+    addRow(tbl, 10, "E1",    "Regime: expansion threshold")
+    addRow(tbl, 11, "E2",    "Volatility: ATR/Price band")
+    addRow(tbl, 12, "E3",    "Candle efficiency ≥ " + str.tostring(i_minEfficiency * 100, "#") + "%")
+    addRow(tbl, 13, "E4",    "HTF EMA bias: " + i_htfTF + " EMA" + str.tostring(i_htfEmaLen))
+    addRow(tbl, 14, "E5",    "Displacement ≥ " + str.tostring(i_minDispMult, "#.#") + "× avg body")
+    addRow(tbl, 15, "E6",    "FVG gap ≥ " + str.tostring(i_minFvgQuality, "#.#") + "× ATR")
+    addRow(tbl, 16, "E7",    "Entry confirm: " + i_confirmType)
+    addRow(tbl, 17, "E8",    "Cooldown: " + str.tostring(i_cooldownBars) + " bars")
+
